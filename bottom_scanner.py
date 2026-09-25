@@ -1,18 +1,33 @@
-# bottom_scanner.py - Bottom Reversal Scanner (Oversold + Reversal)
+# bottom_scanner.py - STRONG Bottom Reversal Scanner - Vol 1.5x + MACD Divergence MANDATORY
 import yfinance as yf, pandas as pd, requests, time, os
-from bs4 import BeautifulSoup
 from io import StringIO
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
 def rsi(series, period=14):
     delta = series.diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/period, adjust=False).mean()
     loss = -delta.where(delta < 0, 0).ewm(alpha=1/period, adjust=False).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
+
+def is_hammer(row):
+    try:
+        o,h,l,c = row['Open'], row['High'], row['Low'], row['Close']
+        body = abs(c-o)
+        rng = h-l
+        if rng==0 or body==0: return False
+        lower = min(o,c)-l
+        upper = h-max(o,c)
+        return lower > 2*body and upper < 0.35*rng
+    except: return False
+
+# Nifty 500 list
 headers = {"User-Agent": "Mozilla/5.0"}
 try:
     r = requests.get("https://archives.nseindia.com/content/indices/ind_nifty500list.csv", headers=headers, timeout=10)
@@ -20,91 +35,117 @@ try:
 except:
     df_u = pd.read_csv("https://raw.githubusercontent.com/karthikrangasai/NSE-India-Data/main/ind_nifty500list.csv")
 df_u['ticker'] = df_u['Symbol'] + ".NS"
-def is_hammer(row):
-    try:
-        o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
-        body = abs(c - o)
-        rng = h - l
-        if rng == 0 or body == 0: return False
-        lower = min(o,c) - l
-        upper = h - max(o,c)
-        return lower > 2*body and upper < 0.35*rng
-    except: return False
-def scan_bottom(ticker):
+
+def scan_strong(ticker):
     try:
         df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 200: return None
+        if df.empty or len(df) < 210: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df['EMA200'] = df['Close'].ewm(span=200).mean()
+        
+        # Indicators
+        df['SMA200'] = df['Close'].rolling(200).mean()
         df['RSI'] = rsi(df['Close'])
         df['VolAvg20'] = df['Volume'].rolling(20).mean()
-        df['High52'] = df['High'].rolling(252).max()
-        df['Low52'] = df['Low'].rolling(252).min()
+        # MACD 12,26,9
+        ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = ema12 - ema26
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Hist'] = df['MACD'] - df['Signal']
+        # Support = 20 day low (previous)
+        df['Support20'] = df['Low'].rolling(20).min()
+        
         curr = df.iloc[-1]
         prev = df.iloc[-2]
-        price = curr['Close']
-        rsi_now = curr['RSI']
-        rsi_prev = prev['RSI']
-        high52 = curr['High52']
-        low52 = curr['Low52']
-        ema200 = curr['EMA200']
-        vol_ratio = curr['Volume'] / curr['VolAvg20'] if curr['VolAvg20']>0 else 0
+        prev10 = df.iloc[-11]  # 10 days ago for divergence
+        
+        price = float(curr['Close'])
+        support = float(curr['Support20'])
+        # 52W High for drawdown
+        high52 = float(df['High'].rolling(252).max().iloc[-1])
         drawdown = ((price - high52)/high52)*100
-        near_support = (price <= ema200*1.06 and price >= ema200*0.90) or (price <= low52*1.10)
+        
+        rsi_now = float(curr['RSI'])
+        rsi_prev = float(prev['RSI'])
+        vol_ratio = float(curr['Volume']/curr['VolAvg20']) if curr['VolAvg20']>0 else 0
+        hist = float(curr['Hist'])
+        hist_prev = float(prev['Hist'])
+        hist_10ago = float(prev10['Hist'])
+        price_10ago = float(prev10['Close'])
+        
+        # ===== STRONG FILTERS - MANDATORY =====
+        # 1. Volume MUST be >=1.5x - fail fast
+        vol_ok = vol_ratio >= 1.5
+        if not vol_ok:
+            return None
+            
+        # 2. Price MUST be above support + Green close
+        price_ok = price > support and curr['Close'] > curr['Open']
+        if not price_ok:
+            return None
+        
+        # 3. Drawdown -20% to -40% only (avoid -47% broken like ABLBL)
+        drawdown_ok = -40 <= drawdown <= -20
+        
+        # 4. RSI 25-40 and turning UP
+        rsi_ok = 25 <= rsi_now <= 40 and rsi_now > rsi_prev
+        
+        # 5. MACD Bullish - Histogram >0 and rising OR Divergence (price lower low but hist higher low)
+        macd_rising = hist > 0 and hist > hist_prev
+        divergence = (price < price_10ago) and (hist > hist_10ago) and (hist > hist_prev)
+        macd_ok = macd_rising or divergence
+        
         hammer = is_hammer(curr)
-        engulf = prev['Close'] < prev['Open'] and curr['Close'] > curr['Open'] and curr['Close'] > prev['Open'] and curr['Open'] < prev['Close']
-        reversal_candle = hammer or engulf or (curr['Close'] > curr['Open'] and curr['Close'] > prev['Close'])
-        cond = [
-            drawdown <= -20,
-            rsi_now < 40,
-            rsi_now > rsi_prev,
-            vol_ratio >= 1.5,
-            near_support,
-            reversal_candle
-        ]
-        score = sum(cond)
-        if score >= 4:
-            support = round(ema200 if abs(price-ema200) < abs(price-low52) else low52,2)
-            return {'ticker':ticker, 'price':round(price,2), 'high52':round(high52,2), 'drawdown':round(drawdown,1), 'RSI':round(rsi_now,1), 'RSI_prev':round(rsi_prev,1), 'vol_x':round(vol_ratio,2), 'support':support, 'stop':round(support*0.95,2), 'target':round(price*1.12,2), 'score':score, 'hammer':hammer}
-    except: return None
+        green = curr['Close'] > curr['Open']
+        reversal = hammer or green
+        
+        score = sum([vol_ok, price_ok, drawdown_ok, rsi_ok, macd_ok, reversal])
+        
+        # Need at least 5/6 and MACD must be true
+        if drawdown_ok and rsi_ok and macd_ok and score >= 5:
+            return {
+                'ticker': ticker,
+                'price': round(price,2),
+                'high52': round(high52,2),
+                'drawdown': round(drawdown,1),
+                'RSI': round(rsi_now,1),
+                'RSI_prev': round(rsi_prev,1),
+                'vol_x': round(vol_ratio,2),
+                'hist': round(hist,3),
+                'support': round(support,2),
+                'SL': round(support*0.95,2),
+                'Target': round(price*1.12,2),
+                'score': score,
+                'hammer': hammer,
+                'divergence': divergence
+            }
+    except Exception as e:
+        return None
     return None
-print("Scanning 500 for bottom reversal...")
-results = []
+
+print("Scanning Nifty 500 STRONG bottom reversal (Vol 1.5x + MACD mandatory)...")
+results=[]
 for t in df_u['ticker'].tolist():
-    res = scan_bottom(t)
+    res = scan_strong(t)
     if res: results.append(res)
     time.sleep(0.05)
-df_bot = pd.DataFrame(results)
-if df_bot.empty:
-    send_telegram("🔻 *Bottom Reversal Scanner - 9:20 AM*\nNo bottom reversal setup today. No stock showing strong reversal signal.")
-    print("No bottom picks")
+
+df_res = pd.DataFrame(results)
+
+if df_res.empty:
+    msg = "✅ *Bottom Reversal Scanner - 9:25 AM*\n_No STRONG reversal today._\nVol >=1.5x + MACD bullish + Price>Support + RSI 25-40 — koi stock pass nahi kiya. Fake bounce filtered ✅\n\n_Aaj ke jaise 0.05x-0.15x wale sab reject hue — jis din Vol 1.5x + green close + MACD up ek saath aayega tabhi alert ayega._"
+    send_telegram(msg)
+    print("No strong picks - correctly filtered")
     exit()
-def get_funda(ticker):
-    sym = ticker.replace(".NS","")
-    try:
-        r = requests.get(f"https://www.screener.in/company/{sym}/", headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        data = {}
-        for li in soup.select("#top-ratios li"):
-            try: data[li.find("span",class_="name").text.strip()] = float(li.find("span",class_="number").text.strip().replace("%","").replace(",",""))
-            except: pass
-        return data.get("ROE",0), data.get("ROCE",0)
-    except: return 0,0
-quality = []
-for t in df_bot['ticker'].tolist():
-    roe, roce = get_funda(t)
-    if roe > 12 and roce > 12: quality.append(t)
-    time.sleep(0.7)
-df_final = df_bot[df_bot['ticker'].isin(quality)].sort_values(['score','vol_x'], ascending=False)
-if df_final.empty:
-    df_final = df_bot.sort_values(['score','vol_x'], ascending=False).head(5)
-    note = "_No stock passed ROE>12 filter, showing best technical reversals (check fundamentals manually)_\n\n"
-else:
-    note = f"*Quality Filter: ROE>12 + ROCE>12 ({len(df_final)}/{len(df_bot)} passed)*\n\n"
-msg = f"*🔻 Bottom Reversal Scanner - 9:20 AM*\n{note}"
-for i, row in df_final.head(10).iterrows():
+
+df_res = df_res.sort_values(['vol_x','score'], ascending=False)
+
+msg = f"*✅ STRONG Bottom Reversal - 9:25 AM ({len(df_res)} picks)*\n_Vol >=1.5x + MACD bullish + Price>Support MANDATORY_\n\n"
+for i,row in df_res.head(10).iterrows():
     tag = "🔨 Hammer" if row['hammer'] else "📈 Reversal"
-    msg += f"*{row['ticker']}* ₹{row['price']} (52W High ₹{row['high52']} {row['drawdown']}%) | RSI {row['RSI_prev']}→{row['RSI']} | Vol {row['vol_x']}x | Support ₹{row['support']} | SL ₹{row['stop']} → Target ₹{row['target']} | Score {row['score']}/6 {tag}\n"
-msg += f"\n_Entry: CMP | Target +12% | SL 5% below support | Risk 1% per trade - Bottom is risky, use strict SL_"
+    div = " + Divergence" if row['divergence'] else ""
+    msg += f"*{row['ticker']}* ₹{row['price']} (52W High ₹{row['high52']} {row['drawdown']}%) | RSI {row['RSI_prev']}→{row['RSI']} | Vol {row['vol_x']}x | MACD Hist {row['hist']}{div} | Support ₹{row['support']} | SL ₹{row['SL']} → Target ₹{row['Target']} | Score {row['score']}/6 {tag}\n"
+
+msg += f"\n_Strategy: SL 5% below support compulsory. Target 12% in 5-15 days. Vol 1.5x = big buyers confirmed._"
 send_telegram(msg)
 print(msg)
